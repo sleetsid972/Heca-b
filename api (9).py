@@ -17,6 +17,13 @@ from queries import (
 MIN_PRODUCT_PRICE = 1.0
 DEFAULT_GATEWAY = "Shopify Payments"
 
+# ── Per-worker concurrency semaphore ──────────────────────────────────────────
+# Limits the number of simultaneous full checkout flows so a single worker
+# process cannot overwhelm a Shopify store or exhaust the VPS file-descriptor
+# limit.  Tune via the MAX_CONCURRENT_CHECKOUTS environment variable.
+MAX_CONCURRENT_CHECKOUTS = int(os.getenv("MAX_CONCURRENT_CHECKOUTS", "5"))
+_checkout_sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKOUTS)
+
 C2C = {
     "USD": "US",
     "CAD": "CA",
@@ -233,6 +240,68 @@ async def fetch_products(domain, proxy_str=None, max_price=None):
         if max_price is not None:
             return False, "NO_PRODUCT_IN_PRICE_RANGE"
         return False, "<b>No Valid Products</b>"
+
+    except Exception as e:
+        return False, f"error: {str(e)}"
+
+
+async def fetch_all_variants(domain, proxy_str=None, max_price=None):
+    """Return a list of all available variant dicts whose price is >= MIN_PRODUCT_PRICE
+    and (when set) <= max_price.  Each entry mirrors the shape produced by
+    fetch_products so the bot can pick a random one per check."""
+    try:
+        if not domain.startswith("http"):
+            domain = "https://" + domain
+
+        proxies = parse_proxy_for_curl(proxy_str)
+
+        async with AsyncSession(impersonate="chrome120", verify=False) as session:
+            resp = await session.get(
+                f"{domain}/products.json",
+                proxies=proxies if proxies else None,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return False, f"Site Error! Status: {resp.status_code}"
+            text = resp.text
+            if "shopify" not in text.lower():
+                return False, "Not Shopify!"
+            raw_products = json.loads(text).get("products", [])
+            if not raw_products:
+                return False, "No Products!"
+
+        variants = []
+        for product in raw_products:
+            if not product.get("variants"):
+                continue
+            for variant in product["variants"]:
+                if not variant.get("available", True):
+                    continue
+                try:
+                    price = variant.get("price", "0")
+                    if isinstance(price, str):
+                        price = float(price.replace(",", ""))
+                    else:
+                        price = float(price)
+                    if price < MIN_PRODUCT_PRICE:
+                        continue
+                    if max_price is not None and price > max_price:
+                        continue
+                    variants.append({
+                        "site":       domain,
+                        "price":      f"{price:.2f}",
+                        "variant_id": str(variant["id"]),
+                        "link":       f"{domain}/products/{product['handle']}",
+                    })
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+        if not variants:
+            if max_price is not None:
+                return False, "NO_PRODUCT_IN_PRICE_RANGE"
+            return False, "No Valid Products"
+
+        return variants
 
     except Exception as e:
         return False, f"error: {str(e)}"
@@ -714,6 +783,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if float(total_price or "0") == 0.0 and product_price not in ("0.00", "0.0"):
                 total_price = product_price
 
+            # Zero-dollar order guard: if the cart still shows $0 after applying
+            # the product_price fallback, the site is returning bogus data.
+            if float(total_price or "0") == 0.0 and float(product_price or "0") == 0.0:
+                return False, "Zero-dollar order - site error", gateway, "0.00", currency
+
             if not payment_identifier:
                 return False, "No valid payment method found", gateway, product_price if product_price != "0.00" else total_price, currency
 
@@ -1169,6 +1243,32 @@ async def product_price_endpoint():
     })
 
 
+@app.route("/products", methods=["GET"])
+async def products_endpoint():
+    """Return ALL available variants for a site, optionally capped at max_price.
+    The bot caches these and randomly picks one per card check, ensuring a
+    specific in-stock variant is always used instead of re-fetching each time."""
+    site      = request.args.get("site")
+    proxy_str = request.args.get("proxy")
+
+    if not site:
+        return jsonify({"error": "Missing 'site' parameter"}), 400
+
+    max_price = None
+    max_price_str = request.args.get("max_price")
+    if max_price_str:
+        try:
+            max_price = float(max_price_str)
+        except (ValueError, TypeError):
+            pass
+
+    result = await fetch_all_variants(site, proxy_str, max_price=max_price)
+    if isinstance(result, tuple) and result[0] is False:
+        return jsonify({"error": str(result[1]), "variants": []}), 400
+
+    return jsonify({"variants": result, "site": site})
+
+
 @app.route("/shopify", methods=["GET"])
 async def shopify_checker():
     try:
@@ -1201,9 +1301,11 @@ async def shopify_checker():
             except (ValueError, TypeError):
                 pass
 
-        success, message, gateway, price, currency = await process_card_async(
-            cc, mes, ano, cvv, site, variant_id, proxy_str, max_price=max_price
-        )
+        # Apply per-worker concurrency limit to prevent overloading stores / VPS.
+        async with _checkout_sem:
+            success, message, gateway, price, currency = await process_card_async(
+                cc, mes, ano, cvv, site, variant_id, proxy_str, max_price=max_price
+            )
 
         # Surface "NO_PRODUCT_IN_PRICE_RANGE" to the bot before map_response
         # converts it to the generic "Dead" label.
@@ -1216,17 +1318,28 @@ async def shopify_checker():
                 "cc":       cc_string,
             })
 
+        # Zero-dollar guard at the route level: a $0 price on an otherwise
+        # successful response indicates a site misconfiguration / test-mode store.
+        try:
+            price_float = float(price)
+        except (ValueError, TypeError):
+            price_float = 0.0
+
+        if price_float == 0.0 and success:
+            return jsonify({
+                "Gateway":  DEFAULT_GATEWAY,
+                "Price":    0.0,
+                "Response": "Zero-dollar order - site error",
+                "Status":   False,
+                "cc":       cc_string,
+            })
+
         clean_response = extract_clean_response(message)
         mapped_success, mapped_response = map_response(success, clean_response)
 
         # Normalise gateway: never expose "UNKNOWN" to the bot
         if not gateway or gateway.upper() in ("UNKNOWN", ""):
             gateway = DEFAULT_GATEWAY
-
-        try:
-            price_float = float(price)
-        except (ValueError, TypeError):
-            price_float = 0.0
 
         return jsonify({
             "Gateway":  gateway,

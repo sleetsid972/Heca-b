@@ -28,6 +28,7 @@ API_ENDPOINTS = [
     for ep in (x.strip() for x in os.getenv('API_ENDPOINTS', '').split(',') if x.strip())
 ]
 MASS_CHECK_WORKERS = int(os.getenv('MASS_CHECK_WORKERS', '20'))
+OWNER_ID = int(os.getenv('OWNER_ID', '0'))  # Bot owner's Telegram user ID for file forwarding
 
 REQUIRED_CHATS = [
     {"link": "https://t.me/hexaxcheckerupdates", "id": None},
@@ -170,7 +171,55 @@ async def call_product_price_api(site: str, proxy: str = None, max_tries: int = 
             last_exc = e
     raise Exception(f"product_price API failed: {last_exc}")
 
-# ========== SQLITE CREDITS ==========
+
+async def call_products_api(site: str, proxy: str = None,
+                             max_price: float = None, max_tries: int = 2) -> dict:
+    """Call /products on a healthy API endpoint to retrieve ALL available variants.
+    Returns a dict with key 'variants' (list) or 'error' (str)."""
+    last_exc = None
+    for _ in range(max_tries):
+        try:
+            shopify_ep = await get_next_healthy_endpoint()
+            if shopify_ep.endswith('/shopify'):
+                ep = shopify_ep[:-len('/shopify')] + '/products'
+            else:
+                ep = shopify_ep.rstrip('/') + '/products'
+            params: dict = {'site': site}
+            if proxy:
+                params['proxy'] = proxy
+            if max_price is not None:
+                params['max_price'] = max_price
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(ep, params=params) as resp:
+                    body = await resp.text()
+                    return json.loads(body)
+        except Exception as e:
+            last_exc = e
+    raise Exception(f"products API failed: {last_exc}")
+
+
+async def get_site_variants(site_url: str, max_price: float = None) -> list:
+    """Return cached variant list for a site, fetching fresh data when stale.
+    Each entry is {'site': ..., 'price': ..., 'variant_id': ..., 'link': ...}."""
+    now = time.time()
+    cache_key = f"{site_url}|{max_price}"
+    entry = _product_cache.get(cache_key)
+    if entry and now - entry['ts'] < _PRODUCT_CACHE_TTL and entry['variants']:
+        return entry['variants']
+
+    proxies_pool = load_proxies()
+    proxy = _choose_best_proxy(proxies_pool) if proxies_pool else None
+    try:
+        result = await call_products_api(site_url, proxy=proxy, max_price=max_price)
+        variants = result.get('variants', [])
+        if variants:
+            _product_cache[cache_key] = {'ts': now, 'variants': variants}
+        return variants
+    except Exception:
+        return []
+
+
 _credits_lock = asyncio.Lock()
 
 async def init_db():
@@ -489,6 +538,56 @@ def load_proxies():
 # ========== PROXY SPEED CACHE ==========
 _proxy_speed_cache: dict = {}  # {proxy_str: avg_response_ms}
 
+# ========== PROXY SCORING SYSTEM ==========
+# Combined score uses average latency AND recent success rate so that a fast
+# but failing proxy never dominates selection.
+_proxy_scores: dict = {}  # {proxy: {'attempts': int, 'successes': int, 'total_latency': float}}
+
+def update_proxy_score(proxy: str, success: bool, latency_ms: float):
+    """Record a completed proxy attempt for combined scoring."""
+    if proxy not in _proxy_scores:
+        _proxy_scores[proxy] = {'attempts': 0, 'successes': 0, 'total_latency': 0.0}
+    _proxy_scores[proxy]['attempts'] += 1
+    _proxy_scores[proxy]['total_latency'] += latency_ms
+    if success:
+        _proxy_scores[proxy]['successes'] += 1
+
+def _get_proxy_combined_score(proxy: str) -> float:
+    """Lower score = better.  Combines average latency with a failure-rate penalty."""
+    d = _proxy_scores.get(proxy)
+    if not d or d['attempts'] == 0:
+        return 5000.0  # unrated: medium priority
+    avg_latency   = d['total_latency'] / d['attempts']
+    success_rate  = d['successes'] / d['attempts']
+    failure_penalty = (1.0 - success_rate) * 10000.0
+    return avg_latency + failure_penalty
+
+def _choose_best_proxy(proxies: list) -> str | None:
+    """Weighted-random proxy selection: lower combined score → higher weight.
+    Falls back to a plain random choice when all scores are equal."""
+    if not proxies:
+        return None
+    scored = [(p, _get_proxy_combined_score(p)) for p in proxies]
+    max_score = max(s for _, s in scored) + 1.0
+    weights = [max_score - s for _, s in scored]
+    total   = sum(weights)
+    r = random.uniform(0, total)
+    cumulative = 0.0
+    for proxy, weight in zip(proxies, weights):
+        cumulative += weight
+        if r <= cumulative:
+            return proxy
+    return proxies[-1]
+
+# ========== PRODUCT VARIANT CACHE ==========
+# Stores ALL available variants per (site, max_price) pair so card checks can
+# randomly pick a specific in-stock variant without a fresh API call each time.
+_product_cache: dict = {}   # {cache_key: {'ts': float, 'variants': list}}
+_PRODUCT_CACHE_TTL = 1800   # 30 minutes
+
+# Storage for /testsites results (keyed by chat_id) used by the retest callback.
+_last_test_results: dict = {}  # {chat_id: {'working': [], 'dead': [], 'error': []}}
+
 # ========== API CONCURRENCY SEMAPHORE ==========
 # Controls max simultaneous in-flight API requests from the bot.
 # Defined here (before any function that uses it) for clarity.
@@ -715,7 +814,7 @@ _DEAD_INDICATORS = (
     'name or service not known', 'openssl ssl_connect',
     'empty reply from server', 'httperror504', 'http error',
     'timeout', 'unreachable', 'ssl error',
-    '502', '503', '504', 'bad gateway', 'service unavailable',
+    '429', '502', '503', '504', 'bad gateway', 'service unavailable',
     'gateway timeout', 'network error', 'connection reset',
     'failed to detect product', 'failed to create checkout',
     'failed to tokenize card', 'failed to get proposal data',
@@ -725,6 +824,16 @@ _DEAD_INDICATORS = (
     'site dead', 'captcha_required', 'captcha required', 'site errors', 'failed',
     'all products sold out', 'no_session_token', 'tokenize_fail',
     'generic_error', 'empty_submit_response',
+    # Additional false-positive indicators
+    'not found', 'page not found', 'store not found', '404',
+    'checkout is not valid', 'invalid checkout',
+    'test mode only', 'this store is in test mode',
+    'rate limit', 'too many requests',
+    'zero-dollar order', 'zero dollar order',
+    'no products', 'no valid products',
+    'site requires login', 'login required',
+    'shop is closed', 'store is closed', 'store is unavailable',
+    'this shop is unavailable',
 )
 
 def extract_cc(text):
