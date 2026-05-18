@@ -2602,6 +2602,264 @@ async def get_all_proxies(event):
         except Exception:
             pass
 
+# ========== LIVE SITE TESTING WITH PROGRESS BAR ==========
+# Persistence file for site test results
+SITE_TEST_RESULTS_FILE = 'site_test_results.json'
+
+def load_site_test_results():
+    """Load persisted site test results."""
+    if not os.path.exists(SITE_TEST_RESULTS_FILE):
+        return {}
+    try:
+        with open(SITE_TEST_RESULTS_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_site_test_results(results):
+    """Save site test results to disk."""
+    try:
+        with open(SITE_TEST_RESULTS_FILE, 'w') as f:
+            json.dump(results, f, indent=2)
+    except Exception as e:
+        print(f"Error saving site test results: {e}")
+
+async def live_site_test_progress(chat_id, sites, proxies):
+    """
+    Test all sites with live progress bar updates in Telegram.
+    Returns: dict with 'working', 'dead', 'error' site lists
+    """
+    if not sites:
+        await bot.send_message(chat_id, premium_emoji("❌ No sites to test!"), parse_mode='html')
+        return {'working': [], 'dead': [], 'error': []}
+
+    if not proxies:
+        await bot.send_message(chat_id, premium_emoji("❌ No proxies available for testing!"), parse_mode='html')
+        return {'working': [], 'dead': [], 'error': []}
+
+    total = len(sites)
+    completed = 0
+    start_time = time.time()
+
+    results = {
+        'working': [],
+        'dead': [],
+        'error': []
+    }
+
+    recent_results = []  # Keep last 10 for display
+
+    # Initial message
+    bar_blocks = 20
+    filled = 0
+    empty = bar_blocks
+    bar = "█" * filled + "░" * empty
+    percentage = 0
+
+    initial_msg = f"""🔍 <b>Site Testing Progress</b>
+
+[{bar}] {percentage}%
+{completed}/{total} sites tested
+
+<b>Current:</b> Starting...
+
+<b>Recent Results:</b>
+<i>No results yet...</i>
+
+⏱️ <b>Elapsed:</b> 0s"""
+
+    progress_msg = await bot.send_message(chat_id, premium_emoji(initial_msg), parse_mode='html')
+
+    # Test sites with concurrency limit
+    sem = asyncio.Semaphore(10)  # 10 concurrent tests
+    last_edit_time = 0
+    edit_cooldown = 2.0  # Telegram rate limit: edit every 2 seconds minimum
+
+    async def test_single_site(site):
+        nonlocal completed, last_edit_time
+        async with sem:
+            proxy = random.choice(proxies)
+            test_card = "5154623245618097|03|2032|156"
+
+            site_start = time.time()
+            status = "⚠️"
+            status_text = "error"
+
+            try:
+                params = {'cc': test_card, 'site': site, 'proxy': proxy}
+                raw = await asyncio.wait_for(call_checker_api(params), timeout=30)
+
+                response_msg = str(raw.get('Response', '')).lower()
+                api_status = raw.get('Status', False)
+                price = raw.get('Price', 0)
+
+                # Classify result
+                try:
+                    price_float = float(price) if price != '-' else 0.0
+                except (ValueError, TypeError):
+                    price_float = 0.0
+
+                # Dead indicators or zero price
+                if is_dead_site_error(response_msg) or price_float == 0.0:
+                    status = "❌"
+                    status_text = "dead"
+                    results['dead'].append(site)
+                # Valid response (Approved, Charged, or Declined)
+                elif api_status or any(x in response_msg for x in ['charged', 'approved', 'declined', 'insufficient']):
+                    status = "✅"
+                    status_text = "working"
+                    results['working'].append(site)
+                else:
+                    status = "⚠️"
+                    status_text = "error"
+                    results['error'].append(site)
+
+            except asyncio.TimeoutError:
+                status = "❌"
+                status_text = "timeout"
+                results['dead'].append(site)
+            except Exception as e:
+                error_lower = str(e).lower()
+                if is_dead_site_error(error_lower):
+                    status = "❌"
+                    status_text = "dead"
+                    results['dead'].append(site)
+                else:
+                    status = "⚠️"
+                    status_text = "error"
+                    results['error'].append(site)
+
+            elapsed_site = time.time() - site_start
+            completed += 1
+
+            # Add to recent results (keep last 10)
+            recent_results.append(f"{status} {site} ({elapsed_site:.1f}s)")
+            if len(recent_results) > 10:
+                recent_results.pop(0)
+
+            # Update progress bar (with rate limiting)
+            now = time.time()
+            if now - last_edit_time >= edit_cooldown or completed == total:
+                last_edit_time = now
+
+                percentage = int((completed / total) * 100)
+                filled = int((completed / total) * bar_blocks)
+                empty = bar_blocks - filled
+                bar = "█" * filled + "░" * empty
+
+                elapsed_total = int(now - start_time)
+                mins = elapsed_total // 60
+                secs = elapsed_total % 60
+
+                recent_display = "\n".join(recent_results[-10:]) if recent_results else "<i>No results yet...</i>"
+
+                progress_text = f"""🔍 <b>Site Testing Progress</b>
+
+[{bar}] {percentage}%
+{completed}/{total} sites tested
+
+<b>Current:</b> {site if completed < total else "Complete!"}
+
+<b>Recent Results:</b>
+{recent_display}
+
+⏱️ <b>Elapsed:</b> {mins}m {secs}s
+✅ Working: {len(results['working'])} | ❌ Dead: {len(results['dead'])} | ⚠️ Error: {len(results['error'])}"""
+
+                try:
+                    await progress_msg.edit(premium_emoji(progress_text), parse_mode='html')
+                except Exception:
+                    pass  # Rate limit hit, skip this update
+
+    # Run all tests
+    tasks = [test_single_site(site) for site in sites]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Final summary with inline keyboard
+    elapsed_total = int(time.time() - start_time)
+    mins = elapsed_total // 60
+    secs = elapsed_total % 60
+
+    summary = f"""✅ <b>Site Testing Complete!</b>
+
+<b>Summary:</b>
+✅ <b>Working:</b> {len(results['working'])}
+❌ <b>Dead:</b> {len(results['dead'])}
+⚠️ <b>Error:</b> {len(results['error'])}
+
+<b>Total:</b> {total} sites tested
+⏱️ <b>Time:</b> {mins}m {secs}s
+
+<i>Working sites have been cached for use in card checks.</i>"""
+
+    # Add retest button if there are dead sites
+    buttons = None
+    if results['dead']:
+        buttons = [[Button.inline("🔄 Retest Dead Sites", b"retest_dead")]]
+
+    try:
+        await progress_msg.edit(premium_emoji(summary), parse_mode='html', buttons=buttons)
+    except Exception:
+        pass
+
+    # Update healthy endpoints list with working sites
+    global _healthy_endpoints
+    async with _endpoint_lock:
+        # Save current working sites for site testing (not API endpoints)
+        persisted = {
+            'timestamp': time.time(),
+            'working': results['working'],
+            'dead': results['dead'],
+            'error': results['error']
+        }
+        save_site_test_results(persisted)
+
+    return results
+
+@bot.on(events.NewMessage(pattern='/testsites'))
+async def test_sites_command(event):
+    """Admin command to manually trigger site testing with live progress."""
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        return await event.reply(premium_emoji("❌ <b>Admin only command!</b>"), parse_mode='html')
+
+    sites = load_sites()
+    proxies = load_proxies()
+
+    if not sites:
+        return await event.reply(premium_emoji("❌ No sites loaded in sites.txt!"), parse_mode='html')
+
+    if not proxies:
+        return await event.reply(premium_emoji("❌ No proxies loaded in proxy.txt!"), parse_mode='html')
+
+    await event.reply(premium_emoji(f"🚀 <b>Starting site test...</b>\n\nTesting {len(sites)} sites with {len(proxies)} proxies."), parse_mode='html')
+
+    # Run the live progress test
+    await live_site_test_progress(event.chat_id, sites, proxies)
+
+@bot.on(events.CallbackQuery(pattern=b"retest_dead"))
+async def retest_dead_sites(event):
+    """Retest only sites that failed in the previous test."""
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        return await event.answer("❌ Admin only!", alert=True)
+
+    # Load previous results
+    prev_results = load_site_test_results()
+    dead_sites = prev_results.get('dead', [])
+
+    if not dead_sites:
+        return await event.answer("No dead sites to retest!", alert=False)
+
+    proxies = load_proxies()
+    if not proxies:
+        return await event.answer("❌ No proxies available!", alert=True)
+
+    await event.answer("🔄 Retesting dead sites...", alert=False)
+
+    # Run test on dead sites only
+    await live_site_test_progress(event.chat_id, dead_sites, proxies)
+
 # ========== CALLBACKS ==========
 
 @bot.on(events.CallbackQuery(pattern=b"pause"))
