@@ -171,6 +171,31 @@ async def call_product_price_api(site: str, proxy: str = None, max_tries: int = 
             last_exc = e
     raise Exception(f"product_price API failed: {last_exc}")
 
+async def call_products_api(site: str, proxy: str = None, max_price: float = None, max_tries: int = 2) -> dict:
+    """Call /products API endpoint to get all variants under price cap."""
+    last_exc = None
+    for _ in range(max_tries):
+        try:
+            shopify_ep = await get_next_healthy_endpoint()
+            # Derive /products URL from the /shopify endpoint
+            if shopify_ep.endswith('/shopify'):
+                ep = shopify_ep[:-len('/shopify')] + '/products'
+            else:
+                ep = shopify_ep.rstrip('/') + '/products'
+            params: dict = {'site': site}
+            if proxy:
+                params['proxy'] = proxy
+            if max_price is not None:
+                params['max_price'] = max_price
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(ep, params=params) as resp:
+                    body = await resp.text()
+                    return json.loads(body)
+        except Exception as e:
+            last_exc = e
+    raise Exception(f"products API failed: {last_exc}")
+
 # ========== SQLITE CREDITS ==========
 _credits_lock = asyncio.Lock()
 
@@ -571,6 +596,91 @@ def _choose_fastest_proxies(proxies: list, n: int = 3) -> list:
 _site_price_cache: dict = {}   # {site_url: (timestamp, min_price_or_none)}
 _PRICE_CACHE_TTL = 3600        # 1 hour
 
+# ========== PRODUCT VARIANT CACHE ==========
+# Caches all available variants per site for intelligent product selection
+_product_cache: dict = {}  # {site_url: {"timestamp": float, "variants": [{"variant_id": str, "price": float}, ...]}}
+_PRODUCT_CACHE_TTL = 1800  # 30 minutes
+
+async def fetch_and_cache_products(site_url: str, max_price: float = None) -> list:
+    """
+    Fetch all variants for a site from the /products API and cache them.
+    Returns list of variant dicts: [{"variant_id": "123", "price": 10.50}, ...]
+    """
+    domain = site_url if site_url.startswith("http") else f"https://{site_url}"
+    proxies_pool = load_proxies()
+    proxy = choose_best_proxies(proxies_pool, n=1)[0] if proxies_pool else None
+
+    try:
+        async with _api_semaphore:
+            result = await call_products_api(domain, proxy=proxy, max_price=max_price)
+
+        if "error" in result:
+            return []
+
+        variants = result.get("variants", [])
+        if not variants:
+            return []
+
+        # Convert to simplified format
+        variant_list = []
+        for v in variants:
+            try:
+                variant_list.append({
+                    "variant_id": v["variant_id"],
+                    "price": float(v["price"])
+                })
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        # Cache the results
+        _product_cache[site_url] = {
+            "timestamp": time.time(),
+            "variants": variant_list
+        }
+
+        return variant_list
+
+    except Exception:
+        return []
+
+def get_cached_products(site_url: str) -> list:
+    """Get cached variants for a site if fresh enough."""
+    cached = _product_cache.get(site_url)
+    if not cached:
+        return []
+
+    # Check if cache is stale
+    if time.time() - cached["timestamp"] > _PRODUCT_CACHE_TTL:
+        return []
+
+    return cached.get("variants", [])
+
+async def get_random_variant_for_site(site_url: str, max_price: float = None) -> str | None:
+    """
+    Get a random variant_id from cached products for this site.
+    If cache is empty/stale, fetch fresh products.
+    Returns variant_id or None if no products available.
+    """
+    variants = get_cached_products(site_url)
+
+    # Refresh cache if empty or stale
+    if not variants:
+        variants = await fetch_and_cache_products(site_url, max_price=max_price)
+
+    if not variants:
+        return None
+
+    # Filter by max_price if specified
+    if max_price is not None:
+        variants = [v for v in variants if v["price"] <= max_price]
+
+    if not variants:
+        return None
+
+    # Pick random variant
+    chosen = random.choice(variants)
+    return chosen["variant_id"]
+
 async def _fetch_cheapest_price(site_url: str) -> float | None:
     """Fetch cheapest available product price via the API's /product_price endpoint.
     Uses the same load-balanced, health-aware API pool as card checks.
@@ -818,7 +928,7 @@ async def get_bin_info(card_number):
         return '-', '-', '-', '-', '-', ''
 
 # ========== SIMPLIFIED CARD CHECKER ==========
-async def check_card(card, site, proxy):
+async def check_card(card, site, proxy, use_variant_cache=True):
     try:
         parts = card.split('|')
         if len(parts) != 4:
@@ -830,12 +940,29 @@ async def check_card(card, site, proxy):
             }
 
         params = {'cc': card, 'site': site, 'proxy': proxy}
-        # Pass the active price filter ceiling to the API so it only picks
-        # variants within the user's budget. Skip if filter is "all".
-        if ACTIVE_FILTER != "all":
-            flt_max = SITE_FILTERS[ACTIVE_FILTER]["max"]
-            if flt_max < 999999:
-                params['max_price'] = flt_max
+
+        # NEW: Optionally fetch a random variant from cache to avoid out-of-stock issues
+        if use_variant_cache:
+            max_price = None
+            if ACTIVE_FILTER != "all":
+                flt_max = SITE_FILTERS[ACTIVE_FILTER]["max"]
+                if flt_max < 999999:
+                    max_price = flt_max
+
+            variant_id = await get_random_variant_for_site(site, max_price=max_price)
+            if variant_id:
+                params['variant'] = variant_id
+            else:
+                # No cached variants available, pass max_price to API
+                if max_price is not None:
+                    params['max_price'] = max_price
+        else:
+            # Legacy mode: let API fetch products
+            if ACTIVE_FILTER != "all":
+                flt_max = SITE_FILTERS[ACTIVE_FILTER]["max"]
+                if flt_max < 999999:
+                    params['max_price'] = flt_max
+
         raw = await call_checker_api(params)
 
         response_msg = raw.get('Response', '')
@@ -1427,7 +1554,52 @@ async def cache_status_command(event):
         f"📦 Total sites: <b>{total}</b>\n"
         f"✅ Cached: <b>{cached_count}</b>\n"
         f"⏳ Uncached: <b>{remaining}</b>\n"
-        f"🎯 Matching filter: <b>{matched}</b>"
+        f"🎯 Matching filter: <b>{matched}</b>\n\n"
+        f"💾 Product cache: <b>{len(_product_cache)}</b> sites"
+    ), parse_mode='html')
+
+@bot.on(events.NewMessage(pattern='/refreshproducts'))
+async def refresh_products_command(event):
+    """Admin command to refresh the product variant cache for all sites."""
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        return await event.reply(premium_emoji("❌ <b>Admin only command!</b>"), parse_mode='html')
+
+    sites = await load_filtered_sites()
+    if not sites:
+        return await event.reply(premium_emoji("❌ No sites available to refresh!"), parse_mode='html')
+
+    max_price = None
+    if ACTIVE_FILTER != "all":
+        max_price = SITE_FILTERS[ACTIVE_FILTER]["max"]
+
+    status_msg = await event.reply(
+        premium_emoji(f"🔄 <b>Refreshing product cache...</b>\n\nFetching variants for {len(sites)} sites..."),
+        parse_mode='html'
+    )
+
+    # Refresh products in batches
+    sem = asyncio.Semaphore(10)
+    success = 0
+    failed = 0
+
+    async def refresh_single(site):
+        nonlocal success, failed
+        async with sem:
+            variants = await fetch_and_cache_products(site, max_price=max_price)
+            if variants:
+                success += 1
+            else:
+                failed += 1
+
+    tasks = [refresh_single(s) for s in sites]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    await status_msg.edit(premium_emoji(
+        f"✅ <b>Product cache refresh complete!</b>\n\n"
+        f"✅ Success: {success}\n"
+        f"❌ Failed: {failed}\n"
+        f"💾 Total cached: {len(_product_cache)} sites"
     ), parse_mode='html')
 
 # ========== ADMIN - API STATUS ==========
