@@ -962,6 +962,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     if receipt:
                         receipt_type = receipt.get("__typename", "")
                         if receipt_type == "ProcessedReceipt":
+                            # Guard: reject zero-dollar orders as site errors
+                            try:
+                                order_total_data = receipt.get("order", {}).get("totalPriceV2", {})
+                                order_amount = float(order_total_data.get("amount", "0") or "0")
+                                if order_amount == 0.0:
+                                    return False, "ZERO_DOLLAR_ORDER", gateway, product_price if product_price != "0.00" else total_price, currency
+                            except (ValueError, TypeError, KeyError, AttributeError):
+                                pass
                             return True, "ORDER_PLACED", gateway, total_price, currency
                         elif receipt_type == "ActionRequiredReceipt":
                             return True, "3DS_REQUIRED", gateway, total_price, currency
@@ -1030,6 +1038,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         typename = receipt_data.get("__typename", "")
 
                         if typename == "ProcessedReceipt":
+                            # Guard: reject zero-dollar orders as site errors
+                            try:
+                                order_total_data = receipt_data.get("order", {}).get("totalPriceV2", {})
+                                order_amount = float(order_total_data.get("amount", "0") or "0")
+                                if order_amount == 0.0:
+                                    return False, "ZERO_DOLLAR_ORDER", gateway, product_price if product_price != "0.00" else total_price, currency
+                            except (ValueError, TypeError, KeyError, AttributeError):
+                                pass
                             return True, "ORDER_PLACED", gateway, total_price, currency
                         elif typename == "FailedReceipt":
                             error      = receipt_data.get("processingError", {})
@@ -1109,10 +1125,16 @@ def parse_cc_string(cc_string):
 
 
 async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, max_price=None):
-    result = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str, max_price=max_price)
+    # Use semaphore to limit concurrent checkouts per worker
+    async with _checkout_semaphore:
+        result = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str, max_price=max_price)
     # Normalize to always return exactly 5 values
     return result[:5]
 
+
+# ========== CONCURRENCY LIMITER PER WORKER ==========
+# Limits the number of concurrent Shopify GraphQL requests to prevent overload
+_checkout_semaphore = asyncio.Semaphore(5)
 
 app = Quart(__name__)
 
@@ -1134,6 +1156,87 @@ async def worker_count():
         return jsonify({"workers": 0})
     except Exception:
         return jsonify({"workers": "unknown"})
+
+
+@app.route("/products", methods=["GET"])
+async def products_endpoint():
+    """Return ALL product variants under the price cap for a given site."""
+    site      = request.args.get("site")
+    proxy_str = request.args.get("proxy")
+
+    if not site:
+        return jsonify({"error": "Missing 'site' parameter"}), 400
+
+    max_price = None
+    max_price_str = request.args.get("max_price")
+    if max_price_str:
+        try:
+            max_price = float(max_price_str)
+        except (ValueError, TypeError):
+            pass
+
+    try:
+        if not site.startswith("http"):
+            site = "https://" + site
+
+        proxies = parse_proxy_for_curl(proxy_str)
+
+        async with AsyncSession(impersonate="chrome120", verify=False) as session:
+            resp = await session.get(
+                f"{site}/products.json",
+                proxies=proxies if proxies else None,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return jsonify({"error": f"Site Error! Status: {resp.status_code}"}), 400
+            text = resp.text
+            if "shopify" not in text.lower():
+                return jsonify({"error": "Not Shopify!"}), 400
+            result = json.loads(text).get("products", [])
+            if not result:
+                return jsonify({"error": "No Products!"}), 400
+
+        # Collect ALL variants under price cap
+        variants = []
+        for product in result:
+            if not product.get("variants"):
+                continue
+            for variant in product["variants"]:
+                if not variant.get("available", True):
+                    continue
+                try:
+                    price = variant.get("price", "0")
+                    if isinstance(price, str):
+                        price = float(price.replace(",", ""))
+                    else:
+                        price = float(price)
+
+                    # Apply price filter if set
+                    if max_price is not None and price > max_price:
+                        continue
+
+                    # Skip free products
+                    if price < MIN_PRODUCT_PRICE:
+                        continue
+
+                    variants.append({
+                        "site": site,
+                        "price": f"{price:.2f}",
+                        "variant_id": str(variant["id"]),
+                        "link": f"{site}/products/{product['handle']}",
+                    })
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+        if not variants:
+            if max_price is not None:
+                return jsonify({"error": "NO_PRODUCT_IN_PRICE_RANGE"}), 400
+            return jsonify({"error": "No Valid Products"}), 400
+
+        return jsonify({"variants": variants, "count": len(variants)})
+
+    except Exception as e:
+        return jsonify({"error": f"error: {str(e)}"}), 500
 
 
 @app.route("/product_price", methods=["GET"])
