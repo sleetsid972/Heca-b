@@ -40,27 +40,53 @@ book = {
     "DEFAULT": {"address1": "123 Main",              "city": "New York", "postalCode": "10080",   "zoneCode": "NY",  "countryCode": "US", "phone": "2194157586"},
 }
 
-HARD_DECLINES = frozenset({
-    "CARD_DECLINED", "DO_NOT_HONOR", "EXPIRED_CARD", "INVALID_CARD",
-    "STOLEN_CARD", "LOST_CARD", "RESTRICTED_CARD", "PICKUP_CARD",
-    "INVALID_AMOUNT", "INVALID_ACCOUNT", "INVALID_CURRENCY",
-    "TRANSACTION_NOT_ALLOWED", "SECURITY_VIOLATION", "BLOCKED",
-    "CARD_NOT_SUPPORTED", "NOT_PERMITTED", "CALL_ISSUER", "FRAUD",
-    "GENERIC_DECLINE", "DECLINED", "DECLINE", "INSUFFICIENT_FUNDS_DECLINE",
-    "REVOCATION_OF_AUTHORIZATION", "REVOCATION_OF_ALL_AUTHORIZATIONS",
+# SITE-LEVEL ERRORS: These indicate the site cannot process checkouts, not card issues
+SITE_ERRORS = frozenset({
+    "CAPTCHA_REQUIRED", "NO_PRODUCT_IN_PRICE_RANGE", "ZERO_DOLLAR_ORDER",
+    "SITE_ERROR", "TIMEOUT", "CONNECTION_FAILED", "SSL_ERROR",
+    "HTTP_ERROR", "CLOUDFLARE", "EMPTY_RESPONSE", "INVALID_URL",
 })
 
 
-def map_response(success, raw_response):
-    """Map raw checkout result to simplified Status/Response."""
+def map_response(success: bool, raw_response: str) -> tuple[bool, str]:
+    """
+    Map raw checkout result to simplified Status/Response.
+
+    CRITICAL SITE TESTING LOGIC:
+    - A site is WORKING if it processes checkout to payment processor (even if declined)
+    - Returns (True, status) for: Charged, Approved, Declined, Insufficient Funds
+    - Returns (False, error) ONLY for site-level failures that prevent checkout
+
+    Args:
+        success: Whether API call succeeded
+        raw_response: Response message from checkout
+
+    Returns:
+        (is_working, status_message) tuple
+    """
     raw_upper = (raw_response or "").upper().strip()
-    if raw_upper == "ORDER_PLACED":
+
+    # Charged = site is working
+    if raw_upper == "ORDER_PLACED" or "CHARGED" in raw_upper:
         return True, "Charged"
+
+    # Check for site-level errors (these mean site is DEAD)
+    for site_error in SITE_ERRORS:
+        if site_error in raw_upper:
+            return False, raw_response or "Site Error"
+
+    # If API call failed but not a site error, assume site issue
     if not success:
-        return False, "Dead"
-    for code in HARD_DECLINES:
-        if code in raw_upper:
-            return False, "Dead"
+        return False, raw_response or "Dead"
+
+    # ALL OTHER RESPONSES = site is working (including all card declines)
+    # Card declines (CARD_DECLINED, INSUFFICIENT_FUNDS, etc.) prove site works
+    if any(x in raw_upper for x in ["DECLINED", "INSUFFICIENT", "EXPIRED", "INVALID",
+                                      "STOLEN", "LOST", "RESTRICTED", "BLOCKED",
+                                      "NOT_PERMITTED", "FRAUD", "3DS", "OTP"]):
+        return True, "Declined"
+
+    # Default: if we got here, site processed the request
     return True, "Approved"
 
 
