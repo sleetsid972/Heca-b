@@ -1,0 +1,15 @@
+[Unit]
+Description=Shopify Card Checker API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/shopify-checker
+ExecStart=/usr/bin/python3 /root/shopify-checker/api.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
