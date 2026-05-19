@@ -177,7 +177,10 @@ async def health_check_loop():
     """Continuously check API endpoints health"""
     while True:
         for ep in API_ENDPOINTS:
+            # Remove /shopify suffix if present to get base URL
             base = ep.rstrip('/shopify')
+            if base.endswith('/'):
+                base = base.rstrip('/')
             health_url = f"{base}/health"
             try:
                 timeout = aiohttp.ClientTimeout(total=5)
@@ -193,7 +196,7 @@ async def health_check_loop():
 
 
 async def get_next_healthy_endpoint() -> str:
-    """Get next healthy API endpoint (round-robin)"""
+    """Get next healthy API base URL (round-robin)"""
     global _endpoint_index
     async with _endpoint_lock:
         pool = list(_healthy_endpoints) if _healthy_endpoints else API_ENDPOINTS
@@ -205,12 +208,28 @@ async def get_next_healthy_endpoint() -> str:
 
 
 async def call_api(endpoint: str, params: dict, max_tries: int = 2) -> dict:
-    """Call API with retries and load balancing"""
+    """Call API with retries and load balancing
+
+    Args:
+        endpoint: The API endpoint path (e.g., '/shopify', '/product_price', '/health')
+        params: Query parameters
+        max_tries: Number of retry attempts
+    """
     last_error = None
 
     for _ in range(max_tries):
         try:
-            api_url = await get_next_healthy_endpoint()
+            # Get base URL and construct full endpoint
+            base_url = await get_next_healthy_endpoint()
+
+            # Remove /shopify suffix if present in base URL
+            if base_url.endswith('/shopify'):
+                base_url = base_url[:-8]  # Remove '/shopify'
+            base_url = base_url.rstrip('/')
+
+            # Construct full URL
+            api_url = f"{base_url}{endpoint}"
+
             timeout = aiohttp.ClientTimeout(total=120)
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -943,10 +962,12 @@ async def handle_mass_check(event):
                     gateway = result.get('Gateway', 'Unknown')
                     price = result.get('product_price', result.get('Price', 0))
 
+                    # Only Charged and Approved are hits
                     if response in ['Charged', 'Approved']:
                         hits += 1
                         results.append(f"{cc}|{mm}|{yy}|{cvv} | ✅ {response} | {gateway} | ${price} | {site}")
                     else:
+                        # Everything else (including Declined) is dead
                         dead += 1
                         results.append(f"{cc}|{mm}|{yy}|{cvv} | ❌ {response} | {gateway} | ${price} | {site}")
 
