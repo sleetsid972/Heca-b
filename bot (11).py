@@ -2416,6 +2416,8 @@ async def check_command(event):
 
                 all_results['checked'] += 1
 
+                # CRITICAL: In mass check, only Charged and Approved are hits
+                # Declined cards are counted as Dead (user wants only truly working cards)
                 if res['status'] == 'Charged':
                     all_results['charged'].append(res)
                     try:
@@ -2429,6 +2431,7 @@ async def check_command(event):
                     all_results['approved'].append(res)
                     await send_realtime_hit_to_user(user_id, "LIVE", res['card'], res['message'][:150], res.get('gateway', 'Unknown'), res.get('price', '-'))
                 else:
+                    # Declined, Dead, Site Error all count as dead in mass check
                     all_results['dead'].append(res)
 
                 result_queue.task_done()
@@ -3010,6 +3013,28 @@ async def live_site_test_progress(chat_id, sites, proxies):
             'error': results['error']
         }
         save_site_test_results(persisted)
+
+    # AUTO-UPDATE sites.txt: Remove dead sites, keep working + error sites
+    # Error sites get another chance; dead sites are removed
+    if results['dead']:
+        try:
+            kept_sites = results['working'] + results['error']
+            if kept_sites:
+                with open(SITES_FILE, 'w', encoding='utf-8') as f:
+                    for site in kept_sites:
+                        f.write(f"{site}\n")
+
+                await bot.send_message(
+                    chat_id,
+                    premium_emoji(
+                        f"📝 <b>sites.txt updated!</b>\n\n"
+                        f"✅ Kept: {len(kept_sites)} sites (working + error)\n"
+                        f"🗑️ Removed: {len(results['dead'])} dead sites"
+                    ),
+                    parse_mode='html'
+                )
+        except Exception as e:
+            print(f"Error updating sites.txt: {e}")
 
     return results
 
